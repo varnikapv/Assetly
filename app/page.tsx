@@ -398,12 +398,9 @@ export default function Home() {
       {/* ── FOOTER ── */}
       <footer className="relative z-10 border-t border-white/[0.04] px-6 sm:px-10 py-5">
         <div className="max-w-7xl mx-auto flex items-center justify-between">
-          <span
-            className="text-sm italic text-white/20 tracking-wide"
-            style={{ fontFamily: "var(--font-playfair)" }}
-          >
-            Assetly
-          </span>
+           <div className="flex items-center gap-6 text-xs text-white/15">
+            <span className="hidden sm:inline">Assetly</span>
+          </div>
           <div className="flex items-center gap-6 text-xs text-white/15">
             <span className="hidden sm:inline">Built with Next.js + Playwright</span>
           </div>

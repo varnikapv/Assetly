@@ -1,6 +1,7 @@
 "use client";
 
-import { useState } from "react";
+import { useState, useEffect } from "react";
+import { createPortal } from "react-dom";
 import { saveAs } from "file-saver";
 import { AssetCollection } from "@/lib/types";
 
@@ -36,29 +37,97 @@ async function downloadSingle(url: string) {
 // ── Preview Modal ─────────────────────────────────────────────────────────────
 
 function PreviewModal({ src, onClose }: { src: string; onClose: () => void }) {
-  return (
+  const [downloading, setDownloading] = useState(false);
+
+  // Close on Escape key
+  useEffect(() => {
+    const handler = (e: KeyboardEvent) => { if (e.key === "Escape") onClose(); };
+    window.addEventListener("keydown", handler);
+    return () => window.removeEventListener("keydown", handler);
+  }, [onClose]);
+
+  const handleDownload = async (e: React.MouseEvent) => {
+    e.stopPropagation();
+    if (downloading) return;
+    setDownloading(true);
+    await downloadSingle(src);
+    setDownloading(false);
+  };
+
+  const modal = (
     <div
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-sm"
+      className="fixed inset-0 z-[9999] flex items-center justify-center bg-black/75 backdrop-blur-md"
       onClick={onClose}
     >
       <div
-        className="relative max-w-3xl max-h-[80vh] rounded-2xl overflow-hidden border border-white/[0.08] shadow-2xl"
+        className="relative flex flex-col max-w-4xl w-full mx-4 rounded-2xl overflow-hidden border border-white/[0.1] shadow-2xl bg-[#0c0c0c]"
         onClick={(e) => e.stopPropagation()}
       >
-        {/* eslint-disable-next-line @next/next/no-img-element */}
-        <img src={src} alt="" className="max-w-full max-h-[80vh] object-contain" />
-        <button
-          onClick={onClose}
-          className="absolute top-3 right-3 w-8 h-8 rounded-full bg-black/60 border border-white/10 flex items-center justify-center text-white/60 hover:text-white/90 transition-colors"
-        >
-          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-            <line x1="18" y1="6" x2="6" y2="18" />
-            <line x1="6" y1="6" x2="18" y2="18" />
-          </svg>
-        </button>
+        {/* Top bar */}
+        <div className="flex items-center justify-between px-5 py-3 border-b border-white/[0.06]">
+          <p className="text-xs text-white/30 font-mono truncate max-w-[60%]">{getFilename(src)}</p>
+          <div className="flex items-center gap-2">
+            {/* Download */}
+            <button
+              onClick={handleDownload}
+              disabled={downloading}
+              className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-white/[0.06] border border-white/[0.08] text-xs text-white/60 hover:bg-white/[0.1] hover:text-white/90 transition-all duration-150 disabled:opacity-50"
+            >
+              {downloading ? (
+                <svg className="animate-spin" width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round">
+                  <path d="M21 12a9 9 0 1 1-6.219-8.56" />
+                </svg>
+              ) : (
+                <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                  <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+                  <polyline points="7 10 12 15 17 10" />
+                  <line x1="12" y1="15" x2="12" y2="3" />
+                </svg>
+              )}
+              Download
+            </button>
+            {/* Open in new tab */}
+            <a
+              href={src}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-white/[0.06] border border-white/[0.08] text-xs text-white/60 hover:bg-white/[0.1] hover:text-white/90 transition-all duration-150"
+              onClick={(e) => e.stopPropagation()}
+            >
+              <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                <path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6" />
+                <polyline points="15 3 21 3 21 9" />
+                <line x1="10" y1="14" x2="21" y2="3" />
+              </svg>
+              Open
+            </a>
+            {/* Close */}
+            <button
+              onClick={onClose}
+              className="w-7 h-7 rounded-lg bg-white/[0.05] border border-white/[0.08] flex items-center justify-center text-white/40 hover:text-white/80 hover:bg-white/[0.1] transition-all duration-150"
+            >
+              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                <line x1="18" y1="6" x2="6" y2="18" />
+                <line x1="6" y1="6" x2="18" y2="18" />
+              </svg>
+            </button>
+          </div>
+        </div>
+
+        {/* Image area */}
+        <div className="flex items-center justify-center bg-[#080808] p-6 min-h-[300px] max-h-[75vh]">
+          {/* eslint-disable-next-line @next/next/no-img-element */}
+          <img
+            src={src}
+            alt=""
+            className="max-w-full max-h-[70vh] object-contain rounded-lg"
+          />
+        </div>
       </div>
     </div>
   );
+
+  return createPortal(modal, document.body);
 }
 
 // ── Image Tile ────────────────────────────────────────────────────────────────
@@ -119,20 +188,6 @@ function ImageTile({
         )}
       </button>
 
-      {/* Bottom-right: open external */}
-      <a
-        href={src}
-        target="_blank"
-        rel="noopener noreferrer"
-        onClick={(e) => e.stopPropagation()}
-        className="absolute bottom-2 right-2 w-7 h-7 rounded-lg bg-white/10 backdrop-blur-sm border border-white/10 flex items-center justify-center opacity-0 group-hover:opacity-100 transition-all duration-300 translate-y-1 group-hover:translate-y-0"
-      >
-        <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="white" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-          <path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6" />
-          <polyline points="15 3 21 3 21 9" />
-          <line x1="10" y1="14" x2="21" y2="3" />
-        </svg>
-      </a>
     </div>
   );
 }
