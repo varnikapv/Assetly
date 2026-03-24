@@ -1,10 +1,29 @@
 import { NextRequest, NextResponse } from "next/server";
-import { chromium } from "playwright";
+import { chromium as playwrightCore } from "playwright-core";
 import { analyzeColors } from "@/lib/analyzer/colorAnalyzer";
 import { analyzeFonts } from "@/lib/analyzer/fontAnalyzer";
 import { analyzeImages } from "@/lib/analyzer/imageAnalyzer";
 
 export const maxDuration = 60;
+
+/**
+ * Launches a browser appropriate for the current environment.
+ * - On Vercel / Lambda: uses @sparticuz/chromium (serverless-optimised, ~50 MB)
+ * - Locally: falls back to the full Playwright-bundled Chromium
+ */
+async function launchBrowser() {
+  if (process.env.VERCEL || process.env.AWS_LAMBDA_FUNCTION_VERSION) {
+    const chromiumPkg = (await import("@sparticuz/chromium")).default;
+    return playwrightCore.launch({
+      args: chromiumPkg.args,
+      executablePath: await chromiumPkg.executablePath(),
+      headless: true,
+    });
+  }
+  // Local development — use playwright's bundled Chromium
+  const { chromium } = await import("playwright");
+  return chromium.launch({ headless: true });
+}
 
 export async function POST(request: NextRequest) {
   let browser = null;
@@ -30,7 +49,7 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ error: "Invalid URL" }, { status: 400 });
     }
 
-    browser = await chromium.launch({ headless: true });
+    browser = await launchBrowser();
     const context = await browser.newContext({
       userAgent:
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 " +
