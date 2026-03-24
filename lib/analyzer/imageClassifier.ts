@@ -43,7 +43,7 @@ function cleanImages(images: string[]): string[] {
 // ── Step 3: Category Rules ────────────────────────────────────────────────────
 
 function isLogo(filename: string): boolean {
-  return /\blogo\b|\bbrand\b|\bmark\b|\bwordmark\b|\bfavicon\b/.test(filename);
+  return /\blogo\b|\bbrand\b|\bmark\b|\bwordmark\b/.test(filename);
 }
 
 function isIllustration(filename: string): boolean {
