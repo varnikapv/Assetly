@@ -1,33 +1,192 @@
 import { NextRequest, NextResponse } from "next/server";
-import { chromium as playwrightCore } from "playwright-core";
 import { analyzeColors } from "@/lib/analyzer/colorAnalyzer";
 import { analyzeFonts } from "@/lib/analyzer/fontAnalyzer";
 import { analyzeImages } from "@/lib/analyzer/imageAnalyzer";
 
 export const maxDuration = 60;
 
-/**
- * Launches a browser appropriate for the current environment.
- * - On Vercel / Lambda: uses @sparticuz/chromium (serverless-optimised, ~50 MB)
- * - Locally: falls back to the full Playwright-bundled Chromium
- */
-async function launchBrowser() {
-  if (process.env.VERCEL || process.env.AWS_LAMBDA_FUNCTION_VERSION) {
-    const chromiumPkg = (await import("@sparticuz/chromium")).default;
-    return playwrightCore.launch({
-      args: chromiumPkg.args,
-      executablePath: await chromiumPkg.executablePath(),
-      headless: true,
-    });
+const FETCH_HEADERS = {
+  "User-Agent":
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 " +
+    "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+  Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+  "Accept-Language": "en-US,en;q=0.5",
+};
+
+// ── URL helpers ───────────────────────────────────────────────────────────────
+
+function resolve(base: string, relative: string): string | null {
+  try {
+    const u = new URL(relative, base);
+    return u.protocol === "http:" || u.protocol === "https:" ? u.href : null;
+  } catch {
+    return null;
   }
-  // Local development — use playwright's bundled Chromium
-  const { chromium } = await import("playwright");
-  return chromium.launch({ headless: true });
 }
 
-export async function POST(request: NextRequest) {
-  let browser = null;
+// ── CSS extraction helpers ────────────────────────────────────────────────────
 
+const COLOR_RE =
+  /(?:^|[{;])\s*(?:color|background(?:-color)?|border(?:-(?:top|right|bottom|left|block|inline)(?:-(?:start|end))?)?-color|outline-color|fill|stroke)\s*:\s*([^;}"'\n]+)/gi;
+
+const FONT_RE = /(?:^|[{;])\s*font-family\s*:\s*([^;}"'\n]+)/gi;
+
+const URL_RE = /url\(\s*["']?([^"')]+)["']?\s*\)/gi;
+
+function extractColors(css: string): [string, number][] {
+  const out: [string, number][] = [];
+  let m: RegExpExecArray | null;
+  COLOR_RE.lastIndex = 0;
+  while ((m = COLOR_RE.exec(css)) !== null) {
+    const v = m[1].trim();
+    if (v && v !== "transparent" && v !== "inherit" && v !== "currentColor" && v !== "none")
+      out.push([v, 1]);
+  }
+  return out;
+}
+
+function extractFonts(css: string): [string, number][] {
+  const out: [string, number][] = [];
+  let m: RegExpExecArray | null;
+  FONT_RE.lastIndex = 0;
+  while ((m = FONT_RE.exec(css)) !== null) {
+    const v = m[1].trim();
+    if (v) out.push([v, 1]);
+  }
+  return out;
+}
+
+function extractCssImageUrls(css: string, base: string): string[] {
+  const out: string[] = [];
+  let m: RegExpExecArray | null;
+  URL_RE.lastIndex = 0;
+  while ((m = URL_RE.exec(css)) !== null) {
+    const raw = m[1].trim();
+    if (raw.startsWith("data:")) continue;
+    const resolved = resolve(base, raw);
+    if (resolved) out.push(resolved);
+  }
+  return out;
+}
+
+// ── HTML attribute extraction (regex, no DOM) ─────────────────────────────────
+
+/** Extract value of a specific HTML attribute from a tag string. */
+function attr(tag: string, name: string): string | null {
+  const re = new RegExp(`${name}\\s*=\\s*(?:"([^"]*)"|'([^']*)'|([^\\s>]+))`, "i");
+  const m = re.exec(tag);
+  return m ? (m[1] ?? m[2] ?? m[3] ?? null) : null;
+}
+
+// ── Main scraper ──────────────────────────────────────────────────────────────
+
+async function scrapePage(pageUrl: string) {
+  const colorMap: Record<string, number> = {};
+  const fontMap: Record<string, number> = {};
+  const imageSet = new Set<string>();
+
+  function addColors(pairs: [string, number][]) {
+    for (const [k] of pairs) colorMap[k] = (colorMap[k] ?? 0) + 1;
+  }
+  function addFonts(pairs: [string, number][]) {
+    for (const [k] of pairs) fontMap[k] = (fontMap[k] ?? 0) + 1;
+  }
+  function processCSS(css: string) {
+    addColors(extractColors(css));
+    addFonts(extractFonts(css));
+    for (const u of extractCssImageUrls(css, pageUrl)) imageSet.add(u);
+  }
+
+  // ── 1. Fetch the HTML page ───────────────────────────────────────────────
+  const pageRes = await fetch(pageUrl, { headers: FETCH_HEADERS });
+  if (!pageRes.ok) throw new Error(`HTTP ${pageRes.status} fetching page`);
+  const html = await pageRes.text();
+
+  // ── 2. Inline style attributes ──────────────────────────────────────────
+  const inlineStyleRe = /style\s*=\s*(?:"([^"]*)"|'([^']*)')/gi;
+  let m: RegExpExecArray | null;
+  while ((m = inlineStyleRe.exec(html)) !== null) {
+    processCSS(m[1] ?? m[2] ?? "");
+  }
+
+  // ── 3. <style> blocks ───────────────────────────────────────────────────
+  const styleBlockRe = /<style(?:\s[^>]*)?>([^]*?)<\/style>/gi;
+  while ((m = styleBlockRe.exec(html)) !== null) processCSS(m[1]);
+
+  // ── 4. Linked CSS files (fetch concurrently, limit 15) ──────────────────
+  const cssUrls: string[] = [];
+  const linkRe = /<link([^>]+)>/gi;
+  while ((m = linkRe.exec(html)) !== null) {
+    const tag = m[1];
+    const rel = attr(tag, "rel") ?? "";
+    if (!rel.includes("stylesheet")) continue;
+    const href = attr(tag, "href");
+    if (!href) continue;
+    const resolved = resolve(pageUrl, href);
+    if (resolved) cssUrls.push(resolved);
+  }
+
+  await Promise.all(
+    cssUrls.slice(0, 15).map(async (cssUrl) => {
+      try {
+        const r = await fetch(cssUrl, { headers: FETCH_HEADERS });
+        if (r.ok) processCSS(await r.text());
+      } catch { /* skip */ }
+    })
+  );
+
+  // ── 5. <img> src ─────────────────────────────────────────────────────────
+  const imgRe = /<img([^>]+)>/gi;
+  while ((m = imgRe.exec(html)) !== null) {
+    const src = attr(m[1], "src");
+    if (src && !src.startsWith("data:")) {
+      const resolved = resolve(pageUrl, src);
+      if (resolved) imageSet.add(resolved);
+    }
+    // srcset on <img>
+    const srcset = attr(m[1], "srcset");
+    if (srcset) {
+      const first = srcset.split(",")[0]?.trim().split(/\s+/)[0];
+      if (first && !first.startsWith("data:")) {
+        const resolved = resolve(pageUrl, first);
+        if (resolved) imageSet.add(resolved);
+      }
+    }
+  }
+
+  // ── 6. <source srcset> (<picture>) ───────────────────────────────────────
+  const sourceRe = /<source([^>]+)>/gi;
+  while ((m = sourceRe.exec(html)) !== null) {
+    const srcset = attr(m[1], "srcset");
+    if (srcset) {
+      const first = srcset.split(",")[0]?.trim().split(/\s+/)[0];
+      if (first && !first.startsWith("data:")) {
+        const resolved = resolve(pageUrl, first);
+        if (resolved) imageSet.add(resolved);
+      }
+    }
+  }
+
+  // ── 7. SVG <image> href / xlink:href ─────────────────────────────────────
+  const svgImgRe = /<image([^>]+)>/gi;
+  while ((m = svgImgRe.exec(html)) !== null) {
+    const href = attr(m[1], "href") ?? attr(m[1], "xlink:href");
+    if (href && !href.startsWith("data:")) {
+      const resolved = resolve(pageUrl, href);
+      if (resolved) imageSet.add(resolved);
+    }
+  }
+
+  return {
+    colors: colorMap,
+    fonts: fontMap,
+    images: Array.from(imageSet),
+  };
+}
+
+// ── Route handler ─────────────────────────────────────────────────────────────
+
+export async function POST(request: NextRequest) {
   try {
     const { url } = await request.json();
 
@@ -36,10 +195,7 @@ export async function POST(request: NextRequest) {
     }
 
     let normalizedUrl = url.trim();
-    if (
-      !normalizedUrl.startsWith("http://") &&
-      !normalizedUrl.startsWith("https://")
-    ) {
+    if (!normalizedUrl.startsWith("http://") && !normalizedUrl.startsWith("https://")) {
       normalizedUrl = `https://${normalizedUrl}`;
     }
 
@@ -49,86 +205,8 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ error: "Invalid URL" }, { status: 400 });
     }
 
-    browser = await launchBrowser();
-    const context = await browser.newContext({
-      userAgent:
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 " +
-        "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-      viewport: { width: 1440, height: 900 },
-    });
-    const page = await context.newPage();
+    const raw = await scrapePage(normalizedUrl);
 
-    await page.goto(normalizedUrl, {
-      waitUntil: "networkidle",
-      timeout: 30000,
-    });
-
-    // ── Collect raw data with frequency counts ──────────────────────────────
-    // page.evaluate returns plain JSON, so we use Record<string,number> maps.
-    const raw = await page.evaluate(() => {
-      const colorMap: Record<string, number> = {};
-      const fontMap: Record<string, number> = {};
-      const imageSet = new Set<string>();
-
-      const elements = document.querySelectorAll("*");
-
-      elements.forEach((el) => {
-        const s = getComputedStyle(el);
-
-        // Collect every color property that carries visual meaning
-        const colorProps = [
-          s.color,
-          s.backgroundColor,
-          s.borderTopColor,
-          s.borderBottomColor,
-          s.borderLeftColor,
-          s.borderRightColor,
-          s.outlineColor,
-          s.fill,
-          s.stroke,
-        ];
-        for (const c of colorProps) {
-          if (c && c !== "none" && c !== "transparent") {
-            colorMap[c] = (colorMap[c] ?? 0) + 1;
-          }
-        }
-
-        // Font families — raw string with full fallback stack
-        const ff = s.fontFamily;
-        if (ff) fontMap[ff] = (fontMap[ff] ?? 0) + 1;
-
-        // Background images
-        const bgImage = s.backgroundImage;
-        if (bgImage && bgImage !== "none") {
-          const m = bgImage.match(/url\(["']?(.*?)["']?\)/);
-          if (m?.[1] && !m[1].startsWith("data:")) {
-            imageSet.add(m[1]);
-          }
-        }
-      });
-
-      // <img> tags
-      document.querySelectorAll("img").forEach((img) => {
-        if (img.src && !img.src.startsWith("data:")) imageSet.add(img.src);
-      });
-
-      // <picture><source srcset>
-      document.querySelectorAll("source[srcset]").forEach((src) => {
-        const first = (src as HTMLSourceElement).srcset.split(",")[0]?.trim().split(" ")[0];
-        if (first && first.startsWith("http")) imageSet.add(first);
-      });
-
-      return {
-        colors: colorMap,    // { [cssColorString]: count }
-        fonts:  fontMap,     // { [cssFontFamilyString]: count }
-        images: Array.from(imageSet),
-      };
-    });
-
-    await browser.close();
-    browser = null;
-
-    // ── Pass to analyzer layer ──────────────────────────────────────────────
     const colorFreq = new Map(Object.entries(raw.colors));
     const fontFreq  = new Map(Object.entries(raw.fonts));
 
@@ -140,13 +218,8 @@ export async function POST(request: NextRequest) {
   } catch (error) {
     console.error("Analysis error:", error);
     return NextResponse.json(
-      {
-        error:
-          "Unable to analyze this website. It may restrict automated access.",
-      },
+      { error: "Unable to analyze this website. It may restrict automated access." },
       { status: 500 }
     );
-  } finally {
-    if (browser) await browser.close();
   }
 }
